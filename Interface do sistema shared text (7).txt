@@ -1,0 +1,1704 @@
+#!/bin/bash
+
+# ============================================================
+# Script de instalação completa do WorldBox Master AI
+# Versão: 1.0
+# Data: 2026-03-10
+# ============================================================
+# Este script cria toda a estrutura do projeto, instala
+# dependências, gera os arquivos dos scripts (v1.6 bot e
+# v1.3 scraper) e prepara o ambiente para execução.
+# ============================================================
+
+set -e  # interrompe em caso de erro
+
+# Cores para output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}  WorldBox Master AI - Instalador     ${NC}"
+echo -e "${GREEN}========================================${NC}"
+
+# Nome da pasta do projeto
+PROJECT_DIR="worldbox-bot"
+
+# Cria pasta do projeto
+echo -e "${YELLOW}[1/8] Criando diretório do projeto: ./$PROJECT_DIR${NC}"
+mkdir -p "$PROJECT_DIR"
+cd "$PROJECT_DIR"
+
+# Cria ambiente virtual
+echo -e "${YELLOW}[2/8] Criando ambiente virtual Python...${NC}"
+python3 -m venv venv
+source venv/bin/activate
+
+# Atualiza pip
+echo -e "${YELLOW}[3/8] Atualizando pip...${NC}"
+pip install --upgrade pip
+
+# Instala dependências
+echo -e "${YELLOW}[4/8] Instalando dependências (bot e scraper)...${NC}"
+pip install discord.py aiosqlite markovify PyPDF2 aiohttp python-dotenv beautifulsoup4 tqdm reportlab
+
+# Cria arquivo .env
+echo -e "${YELLOW}[5/8] Criando arquivo .env (edite com seu token depois)${NC}"
+cat > .env << 'EOF'
+# Token do bot do Discord (obrigatório)
+DISCORD_BOT_TOKEN=coloque_seu_token_aqui
+
+# Opcional: endpoint da API Google (se for usar LLM remoto)
+# GOOGLE_API_ENDPOINT=https://sua-api-endpoint.com/v1/completions
+
+# IDs dos canais (opcional, pode definir depois com comandos)
+# PRIMARY_CHANNEL_ID=123456789
+# ANNOUNCE_CHANNEL_ID=987654321
+
+# Configurações adicionais (valores padrão já estão no código)
+EOF
+
+# Cria google_keys.json vazio
+echo -e "${YELLOW}[6/8] Criando google_keys.json (opcional)${NC}"
+cat > google_keys.json << 'EOF'
+{
+    "keys": []
+}
+EOF
+
+# Cria pasta system_files
+mkdir -p system_files
+
+# ============================================================
+# Criar arquivo do bot principal (v1.6)
+# ============================================================
+echo -e "${YELLOW}[7/8] Gerando bot principal: worldbox_master_ai_v1_6.py${NC}"
+cat > worldbox_master_ai_v1_6.py << 'EOF'
+# worldbox_master_ai_v1_6.py
+"""
+WorldBox Master AI — versão v1.6
+Build: 2026-03-10
+
+Novidades na v1.6:
+- Memória de mensagens: armazena histórico de conversas por canal e utiliza para contextualizar respostas (via LLM).
+- Comandos para ativar/desativar memória por canal, limpar histórico e ajustar tamanho do histórico.
+- Limpeza automática para manter apenas as últimas N mensagens.
+- Base para futura integração de eventos do mundo no contexto.
+
+Baseia-se na v1.5 com auto-move de entidades e tabela de locations.
+"""
+
+import os
+import re
+import json
+import random
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from collections import Counter
+from typing import List, Optional, Dict, Tuple
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+import aiosqlite
+import markovify
+import PyPDF2
+import aiohttp
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# -----------------------
+# VERSION & CONFIG
+# -----------------------
+VERSION = "v1.6"
+BUILD_DATE = "2026-03-10"
+
+DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+SYSTEM_FOLDER = os.getenv("SYSTEM_FILES_FOLDER", "system_files")
+DB_FILE = os.getenv("DB_FILE", "world.db")
+EVENT_INTERVAL_SECONDS = int(os.getenv("EVENT_INTERVAL_SECONDS", "20"))
+MAJOR_EVENT_INTERVAL_SECONDS = int(os.getenv("MAJOR_EVENT_INTERVAL_SECONDS", "300"))
+MAX_MESSAGE_CHUNK = int(os.getenv("MAX_MESSAGE_CHUNK", "1900"))
+GOOGLE_KEYS_FILE = os.getenv("GOOGLE_KEYS_FILE", "google_keys.json")
+GOOGLE_KEYS_STATE_FILE = os.getenv("GOOGLE_KEYS_STATE_FILE", "google_keys_state.json")
+MAX_GOOGLE_KEYS = int(os.getenv("MAX_GOOGLE_KEYS", "50"))
+PRIMARY_CHANNEL = int(os.getenv("PRIMARY_CHANNEL_ID")) if os.getenv("PRIMARY_CHANNEL_ID") else None
+ANNOUNCE_CHANNEL = int(os.getenv("ANNOUNCE_CHANNEL_ID")) if os.getenv("ANNOUNCE_CHANNEL_ID") else None
+MAX_MESSAGES_PER_MINUTE = int(os.getenv("MAX_MESSAGES_PER_MINUTE", "6"))
+WEBHOOK_INTERACTION_CHANCE = float(os.getenv("WEBHOOK_INTERACTION_CHANCE", "0.08"))
+KEY_BAD_UNBAN_HOURS = int(os.getenv("KEY_BAD_UNBAN_HOURS", "6"))
+AUTO_MOVE_CHANCE = float(os.getenv("AUTO_MOVE_CHANCE", "0.1"))
+
+# Novas configurações de memória
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))
+MEMORY_ENABLED_BY_DEFAULT = os.getenv("MEMORY_ENABLED_BY_DEFAULT", "False").lower() == "true"
+
+# -----------------------
+# LOGGING
+# -----------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logger = logging.getLogger("worldbox_master_ai_v1_6")
+
+# -----------------------
+# Google Keys Manager
+# -----------------------
+class GoogleKeysManager:
+    def __init__(self, keys_file: str = GOOGLE_KEYS_FILE, state_file: str = GOOGLE_KEYS_STATE_FILE):
+        self.keys_file = keys_file
+        self.state_file = state_file
+        self.keys: List[str] = []
+        self.state: Dict = {"index": 0, "bad": {}}
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.keys_file):
+            try:
+                with open(self.keys_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict) and "keys" in data:
+                        keys = data["keys"]
+                    elif isinstance(data, list):
+                        keys = data
+                    else:
+                        keys = []
+                    if len(keys) > MAX_GOOGLE_KEYS:
+                        logger.warning("keys file has >%d keys; trimming", MAX_GOOGLE_KEYS)
+                        keys = keys[:MAX_GOOGLE_KEYS]
+                    self.keys = keys
+            except Exception:
+                logger.exception("failed loading google keys file")
+                self.keys = []
+        else:
+            try:
+                with open(self.keys_file, "w", encoding="utf-8") as f:
+                    json.dump({"keys": []}, f, ensure_ascii=False, indent=2)
+            except Exception:
+                logger.exception("failed creating google keys template")
+            self.keys = []
+
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    self.state = json.load(f)
+            except Exception:
+                logger.exception("failed loading keys state; resetting")
+                self.state = {"index": 0, "bad": {}}
+        else:
+            self._save_state()
+
+        logger.info("GoogleKeysManager loaded %d keys", len(self.keys))
+
+    def _save_state(self):
+        try:
+            with open(self.state_file, "w", encoding="utf-8") as f:
+                json.dump(self.state, f, ensure_ascii=False, indent=2)
+        except Exception:
+            logger.exception("failed saving google keys state")
+
+    def reload_keys(self):
+        self._load()
+
+    def _cleanup_bad(self):
+        changed = False
+        bad = dict(self.state.get("bad", {}))
+        now = datetime.utcnow()
+        to_remove = []
+        for idx_str, ts in bad.items():
+            try:
+                t = datetime.fromisoformat(ts)
+                if (now - t).total_seconds() >= KEY_BAD_UNBAN_HOURS * 3600:
+                    to_remove.append(idx_str)
+            except Exception:
+                to_remove.append(idx_str)
+        for k in to_remove:
+            bad.pop(k, None)
+            changed = True
+        if changed:
+            self.state["bad"] = bad
+            self._save_state()
+
+    def current_key(self) -> Optional[Tuple[int, str]]:
+        if not self.keys:
+            return None
+        self._cleanup_bad()
+        total = len(self.keys)
+        bad = set(int(x) for x in self.state.get("bad", {}).keys())
+        start = int(self.state.get("index", 0)) % total
+        for offset in range(total):
+            i = (start + offset) % total
+            if i not in bad:
+                self.state["index"] = i
+                self._save_state()
+                return i, self.keys[i]
+        return None
+
+    def mark_current_bad_and_advance(self):
+        total = len(self.keys)
+        if total == 0:
+            return
+        idx = int(self.state.get("index", 0)) % total
+        bad = dict(self.state.get("bad", {}))
+        bad[str(idx)] = datetime.utcnow().isoformat()
+        self.state["bad"] = bad
+        for offset in range(1, total+1):
+            nxt = (idx + offset) % total
+            if str(nxt) not in bad:
+                self.state["index"] = nxt
+                break
+        self._save_state()
+        logger.warning("Marked key %d bad and advanced index to %s", idx, self.state.get("index"))
+
+    def add_keys(self, keys: List[str]) -> int:
+        trimmed = keys[:MAX_GOOGLE_KEYS]
+        try:
+            with open(self.keys_file, "w", encoding="utf-8") as f:
+                json.dump({"keys": trimmed}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            logger.exception("failed writing google keys file")
+            return 0
+        self.reload_keys()
+        return len(self.keys)
+
+# -----------------------
+# File/text extraction
+# -----------------------
+def extract_text_from_pdf(filepath: str) -> str:
+    text_parts = []
+    try:
+        with open(filepath, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                txt = page.extract_text()
+                if txt:
+                    text_parts.append(txt)
+    except Exception:
+        logger.exception("erro lendo pdf %s", filepath)
+    return "\n".join(text_parts)
+
+def load_system_corpus(folder: str):
+    if not os.path.exists(folder):
+        os.makedirs(folder, exist_ok=True)
+    corpus_parts = []
+    files_map = {}
+    for fname in sorted(os.listdir(folder)):
+        path = os.path.join(folder, fname)
+        if fname.lower().endswith(".txt"):
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    txt = f.read()
+                    corpus_parts.append(txt)
+                    files_map[fname] = txt
+            except Exception:
+                logger.exception("erro lendo txt %s", path)
+        elif fname.lower().endswith(".pdf"):
+            txt = extract_text_from_pdf(path)
+            if txt.strip():
+                corpus_parts.append(txt)
+                files_map[fname] = txt
+    corpus = "\n\n".join(corpus_parts).strip()
+    if not corpus:
+        corpus = "O mundo está vazio. Adicione páginas da wiki em system_files/."
+    return corpus, files_map
+
+# -----------------------
+# TextGenerator modificado para aceitar histórico
+# -----------------------
+class TextGenerator:
+    def __init__(self, corpus: str, keys_manager: GoogleKeysManager):
+        self.corpus = corpus
+        self.keys_manager = keys_manager
+        self._model = None
+        self.build_markov()
+
+    def build_markov(self):
+        try:
+            self._model = markovify.Text(self.corpus, state_size=2)
+            logger.info("Markov model built")
+        except Exception:
+            logger.exception("markov build error")
+            self._model = None
+
+    async def generate(self, prompt: Optional[str] = None, history: Optional[List[str]] = None, max_tries: int = 5) -> str:
+        seed = prompt or self._make_seed()
+        use_llm = self.keys_manager and self.keys_manager.current_key() is not None
+        if use_llm and history:
+            history_text = "\n".join(history[-10:])
+            full_prompt = f"Histórico da conversa:\n{history_text}\n\nAgora, responda à seguinte mensagem:\n{seed}"
+        else:
+            full_prompt = seed
+
+        cur = self.keys_manager.current_key() if self.keys_manager else None
+        if cur:
+            idx, key = cur
+            try:
+                txt = await call_remote_llm_with_key(full_prompt, key)
+                if txt and txt.strip():
+                    try:
+                        bad = dict(self.keys_manager.state.get("bad", {}))
+                        if str(idx) in bad:
+                            bad.pop(str(idx), None)
+                            self.keys_manager.state["bad"] = bad
+                            self.keys_manager._save_state()
+                    except Exception:
+                        pass
+                    return txt.strip()
+            except Exception as e:
+                logger.warning("remote LLM failed for key idx %s: %s", idx, e)
+                self.keys_manager.mark_current_bad_and_advance()
+                tried = 0
+                total = len(self.keys_manager.keys)
+                while tried < total:
+                    nxt = self.keys_manager.current_key()
+                    if not nxt:
+                        break
+                    i2, key2 = nxt
+                    try:
+                        txt = await call_remote_llm_with_key(full_prompt, key2)
+                        if txt and txt.strip():
+                            return txt.strip()
+                    except Exception:
+                        self.keys_manager.mark_current_bad_and_advance()
+                    tried += 1
+                logger.warning("All remote keys failed; falling back to local")
+        if self._model:
+            for _ in range(max_tries):
+                try:
+                    s = self._model.make_sentence(tries=100)
+                    if s:
+                        return s
+                except Exception:
+                    break
+        return f"{seed} ...algo acontece."
+
+    def _make_seed(self) -> str:
+        lines = [l.strip() for l in self.corpus.splitlines() if l.strip()]
+        return random.choice(lines) if lines else "Algo acontece."
+
+async def call_remote_llm_with_key(prompt: str, api_key: str) -> str:
+    endpoint = os.getenv("GOOGLE_API_ENDPOINT", "")
+    if not endpoint:
+        raise RuntimeError("GOOGLE_API_ENDPOINT não configurado")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"prompt": prompt, "max_tokens": 1024}
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(endpoint, json=payload, headers=headers) as resp:
+            if resp.status == 200:
+                j = await resp.json()
+                for k in ("text", "output", "generated_text", "content"):
+                    if k in j:
+                        val = j[k]
+                        if isinstance(val, list):
+                            return " ".join(val)
+                        return str(val)
+                for v in j.values():
+                    if isinstance(v, str):
+                        return v
+                return ""
+            else:
+                body = await resp.text()
+                raise RuntimeError(f"Remote LLM returned {resp.status}: {body}")
+
+# -----------------------
+# Semantic extraction
+# -----------------------
+def extract_entities_from_corpus(text: str, max_entities: int = 200):
+    words = re.findall(r"\b[A-Z][a-z]{3,}\b", text)
+    freq = Counter(words)
+    entities = []
+    for w, c in freq.most_common(max_entities):
+        if c >= 3 and len(w) > 4:
+            entities.append({
+                "name": w,
+                "kind": "lore",
+                "description": f"Entidade extraída automaticamente: {w} (freq {c})"
+            })
+    return entities
+
+# -----------------------
+# Database wrapper (SQLite) com nova tabela de mensagens
+# -----------------------
+class WorldDB:
+    def __init__(self, db_file: str = DB_FILE):
+        self.db_file = db_file
+
+    async def init(self):
+        async with aiosqlite.connect(self.db_file) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS entities (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    kind TEXT,
+                    description TEXT,
+                    alive INTEGER,
+                    location TEXT
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT,
+                    description TEXT,
+                    importance INTEGER,
+                    timestamp TEXT
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS locations (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    kind TEXT,
+                    description TEXT
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    message_id TEXT PRIMARY KEY,
+                    channel_id TEXT,
+                    user_id TEXT,
+                    user_name TEXT,
+                    content TEXT,
+                    timestamp TEXT
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel_time ON messages(channel_id, timestamp)")
+            await db.commit()
+
+            cur = await db.execute("PRAGMA table_info(entities)")
+            cols = await cur.fetchall()
+            col_names = [c[1] for c in cols]
+            if "location" not in col_names:
+                try:
+                    await db.execute("ALTER TABLE entities ADD COLUMN location TEXT DEFAULT ''")
+                    await db.commit()
+                    logger.info("ALTER TABLE: added 'location' column to entities")
+                except Exception:
+                    logger.exception("failed to add location column")
+
+    async def add_entity(self, ent_id: str, name: str, kind: str, desc: str, alive: int = 1, location: str = ""):
+        if location and location.isdigit():
+            await self.ensure_location(location, f"channel_{location}", "channel", f"Canal ID {location}")
+        async with aiosqlite.connect(self.db_file) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO entities (id,name,kind,description,alive,location) VALUES (?,?,?,?,?,?)",
+                (ent_id, name, kind, desc, alive, location)
+            )
+            await db.commit()
+
+    async def list_entities(self, limit: int = 100):
+        async with aiosqlite.connect(self.db_file) as db:
+            cur = await db.execute("SELECT id,name,kind,description,alive,location FROM entities LIMIT ?", (limit,))
+            rows = await cur.fetchall()
+        return rows
+
+    async def get_entity(self, ent_id: str):
+        async with aiosqlite.connect(self.db_file) as db:
+            cur = await db.execute("SELECT id,name,kind,description,alive,location FROM entities WHERE id=?", (ent_id,))
+            row = await cur.fetchone()
+        return row
+
+    async def move_entity(self, ent_id: str, new_location: str):
+        if new_location and new_location.isdigit():
+            await self.ensure_location(new_location, f"channel_{new_location}", "channel", f"Canal ID {new_location}")
+        async with aiosqlite.connect(self.db_file) as db:
+            await db.execute("UPDATE entities SET location=? WHERE id=?", (new_location, ent_id))
+            await db.commit()
+
+    async def get_all_entity_locations(self) -> List[str]:
+        async with aiosqlite.connect(self.db_file) as db:
+            cur = await db.execute("SELECT DISTINCT location FROM entities WHERE alive=1 AND location != ''")
+            rows = await cur.fetchall()
+        return [r[0] for r in rows if r[0]]
+
+    async def add_event(self, title: str, desc: str, importance: int = 1):
+        async with aiosqlite.connect(self.db_file) as db:
+            await db.execute("INSERT INTO events (title,description,importance,timestamp) VALUES (?,?,?,?)",
+                             (title, desc, importance, datetime.utcnow().isoformat()))
+            await db.commit()
+
+    async def get_meta(self, key: str) -> Optional[str]:
+        async with aiosqlite.connect(self.db_file) as db:
+            cur = await db.execute("SELECT value FROM meta WHERE key=?", (key,))
+            r = await cur.fetchone()
+            return r[0] if r else None
+
+    async def set_meta(self, key: str, value: str):
+        async with aiosqlite.connect(self.db_file) as db:
+            await db.execute("INSERT OR REPLACE INTO meta (key,value) VALUES (?,?)", (key, value))
+            await db.commit()
+
+    async def ensure_location(self, loc_id: str, name: str, kind: str = "unknown", description: str = ""):
+        async with aiosqlite.connect(self.db_file) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO locations (id, name, kind, description) VALUES (?,?,?,?)",
+                (loc_id, name, kind, description)
+            )
+            await db.commit()
+
+    async def list_locations(self) -> List[Tuple[str, str, str, str]]:
+        async with aiosqlite.connect(self.db_file) as db:
+            cur = await db.execute("SELECT id, name, kind, description FROM locations")
+            rows = await cur.fetchall()
+        return rows
+
+    async def add_location(self, loc_id: str, name: str, kind: str, description: str):
+        async with aiosqlite.connect(self.db_file) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO locations (id, name, kind, description) VALUES (?,?,?,?)",
+                (loc_id, name, kind, description)
+            )
+            await db.commit()
+
+    async def add_message(self, message_id: str, channel_id: str, user_id: str, user_name: str, content: str):
+        timestamp = datetime.utcnow().isoformat()
+        async with aiosqlite.connect(self.db_file) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO messages (message_id, channel_id, user_id, user_name, content, timestamp) VALUES (?,?,?,?,?,?)",
+                (message_id, channel_id, user_id, user_name, content, timestamp)
+            )
+            cur = await db.execute("SELECT COUNT(*) FROM messages WHERE channel_id=?", (channel_id,))
+            count = (await cur.fetchone())[0]
+            if count > MAX_HISTORY_MESSAGES:
+                cur = await db.execute(
+                    "SELECT message_id FROM messages WHERE channel_id=? ORDER BY timestamp ASC LIMIT ?",
+                    (channel_id, count - MAX_HISTORY_MESSAGES)
+                )
+                to_delete = [row[0] for row in await cur.fetchall()]
+                for msg_id in to_delete:
+                    await db.execute("DELETE FROM messages WHERE message_id=?", (msg_id,))
+            await db.commit()
+
+    async def get_channel_history(self, channel_id: str, limit: int = MAX_HISTORY_MESSAGES) -> List[Tuple[str, str, str]]:
+        async with aiosqlite.connect(self.db_file) as db:
+            cur = await db.execute(
+                "SELECT user_name, content, timestamp FROM messages WHERE channel_id=? ORDER BY timestamp ASC LIMIT ?",
+                (channel_id, limit)
+            )
+            rows = await cur.fetchall()
+        return rows
+
+    async def clear_channel_history(self, channel_id: str):
+        async with aiosqlite.connect(self.db_file) as db:
+            await db.execute("DELETE FROM messages WHERE channel_id=?", (channel_id,))
+            await db.commit()
+
+# -----------------------
+# Message splitting
+# -----------------------
+def split_long_message(text: str, chunk_size: int = MAX_MESSAGE_CHUNK) -> List[str]:
+    if not text:
+        return []
+    if len(text) <= chunk_size:
+        return [text]
+    parts = []
+    paragraphs = re.split(r"\n{2,}", text)
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        if len(para) <= chunk_size:
+            parts.append(para)
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+", para)
+        cur = ""
+        for s in sentences:
+            if len(s) > chunk_size:
+                words = s.split(" ")
+                cur2 = ""
+                for w in words:
+                    candidate = (cur2 + " " + w).strip() if cur2 else w
+                    if len(candidate) > chunk_size:
+                        if cur2:
+                            parts.append(cur2)
+                        cur2 = w
+                    else:
+                        cur2 = candidate
+                if cur2:
+                    parts.append(cur2)
+                continue
+            if not cur:
+                cur = s
+            else:
+                if len(cur) + 1 + len(s) <= chunk_size:
+                    cur = cur + " " + s
+                else:
+                    parts.append(cur)
+                    cur = s
+        if cur:
+            parts.append(cur)
+    final = []
+    for p in parts:
+        if len(p) <= chunk_size:
+            final.append(p)
+        else:
+            for i in range(0, len(p), chunk_size):
+                final.append(p[i:i+chunk_size])
+    return final
+
+# -----------------------
+# Event engine (com auto-move)
+# -----------------------
+class EventEngine:
+    def __init__(self, db: WorldDB, gen: TextGenerator):
+        self.db = db
+        self.gen = gen
+        self._last_major = datetime.utcnow() - timedelta(seconds=MAJOR_EVENT_INTERVAL_SECONDS)
+
+    async def tick(self):
+        await self._auto_move_entities()
+        roll = random.random()
+        if roll < 0.5:
+            return await self._minor_event()
+        elif roll < 0.9:
+            return await self._moderate_event()
+        else:
+            if (datetime.utcnow() - self._last_major).total_seconds() >= MAJOR_EVENT_INTERVAL_SECONDS:
+                e = await self._major_event()
+                self._last_major = datetime.utcnow()
+                return e
+            return await self._minor_event()
+
+    async def _auto_move_entities(self):
+        entities = await self.db.list_entities(limit=1000)
+        if not entities:
+            return
+        locs = await self.db.list_locations()
+        loc_ids = [loc[0] for loc in locs]
+        if len(loc_ids) < 2:
+            return
+        for ent in entities:
+            if random.random() < AUTO_MOVE_CHANCE:
+                current = ent[5] or ""
+                candidates = [l for l in loc_ids if l != current]
+                if candidates:
+                    new_loc = random.choice(candidates)
+                    await self.db.move_entity(ent[0], new_loc)
+                    logger.debug(f"Entidade {ent[1]} movida automaticamente de {current} para {new_loc}")
+
+    async def _minor_event(self):
+        title = "Evento menor"
+        desc = await self.gen.generate()
+        await self.db.add_event(title, desc, 1)
+        return title, desc, 1
+
+    async def _moderate_event(self):
+        title = "Evento moderado"
+        desc = await self.gen.generate()
+        await self.db.add_event(title, desc, 2)
+        return title, desc, 2
+
+    async def _major_event(self):
+        title = random.choice([
+            "Grande Erupção", "Invasão Dimensional", "Colapso da Rede de Vida",
+            "Ascensão de um Comandante", "Chegada da Entidade Antiga"
+        ])
+        desc = await self.gen.generate(prompt=f"Crie uma cena épica chamada '{title}' com grandes consequências.")
+        await self.db.add_event(title, desc, 5)
+        return title, desc, 5
+
+# -----------------------
+# Discord bot & webhook management
+# -----------------------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.messages = True
+intents.guilds = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
+DB = WorldDB(DB_FILE)
+keys_manager = GoogleKeysManager()
+TEXT_GENERATOR: Optional[TextGenerator] = None
+ENGINE: Optional[EventEngine] = None
+FILES_MAP = {}
+MESSAGE_QUEUE: asyncio.Queue = asyncio.Queue()
+SENDER_TASK = None
+BACKGROUND_TASK = None
+SENT_TIMESTAMPS: List[float] = []
+
+WEBHOOK_MAP_META_KEY = "webhook_map"
+CHANNEL_MEMORY_META_KEY = "channel_memory"
+
+async def get_webhook_map() -> Dict[str, Dict]:
+    raw = await DB.get_meta(WEBHOOK_MAP_META_KEY)
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        logger.exception("failed parsing webhook_map meta")
+        return {}
+
+async def set_webhook_map(mapping: Dict[str, Dict]):
+    await DB.set_meta(WEBHOOK_MAP_META_KEY, json.dumps(mapping))
+
+async def get_memory_enabled_channels() -> set:
+    raw = await DB.get_meta(CHANNEL_MEMORY_META_KEY)
+    if not raw:
+        return set()
+    try:
+        return set(json.loads(raw))
+    except Exception:
+        return set()
+
+async def set_memory_enabled_channels(channels: set):
+    await DB.set_meta(CHANNEL_MEMORY_META_KEY, json.dumps(list(channels)))
+
+async def is_memory_enabled(channel_id: int) -> bool:
+    enabled = await get_memory_enabled_channels()
+    if str(channel_id) in enabled:
+        return True
+    return MEMORY_ENABLED_BY_DEFAULT
+
+async def toggle_memory(channel_id: int) -> bool:
+    enabled = await get_memory_enabled_channels()
+    ch = str(channel_id)
+    if ch in enabled:
+        enabled.remove(ch)
+        new_state = False
+    else:
+        enabled.add(ch)
+        new_state = True
+    await set_memory_enabled_channels(enabled)
+    return new_state
+
+async def ensure_webhook_for_entity(channel: discord.TextChannel, entity_name: str, entity_id: str) -> Optional[discord.Webhook]:
+    try:
+        mapping = await get_webhook_map()
+        ent_key = entity_id
+        if ent_key in mapping:
+            info = mapping[ent_key]
+            wh_id = info.get("webhook_id")
+            ch_id = info.get("channel_id")
+            if ch_id == channel.id and wh_id:
+                try:
+                    wh = await channel.fetch_webhook(int(wh_id))
+                    return wh
+                except Exception:
+                    logger.info("stored webhook %s not found; recreating", wh_id)
+        target_prefix = f"NPC-{entity_name}"[:80]
+        try:
+            hooks = await channel.webhooks()
+            for h in hooks:
+                if h.name and h.name.startswith(target_prefix):
+                    mapping[ent_key] = {"webhook_id": h.id, "name": h.name, "channel_id": channel.id}
+                    await set_webhook_map(mapping)
+                    return h
+        except Exception:
+            logger.exception("failed listing webhooks in channel %s", channel.id)
+        perms = channel.permissions_for(channel.guild.me)
+        if perms.manage_webhooks:
+            wh_name = f"NPC-{entity_name}-{random.randint(10,999)}"
+            try:
+                new_wh = await channel.create_webhook(name=wh_name)
+                mapping[ent_key] = {"webhook_id": new_wh.id, "name": new_wh.name, "channel_id": channel.id}
+                await set_webhook_map(mapping)
+                logger.info("created webhook %s for entity %s in channel %s", new_wh.id, entity_id, channel.id)
+                return new_wh
+            except Exception:
+                logger.exception("failed creating webhook")
+                return None
+        else:
+            logger.warning("bot lacks manage_webhooks in channel %s", channel.id)
+            return None
+    except Exception:
+        logger.exception("ensure_webhook_for_entity failed")
+        return None
+
+async def send_narration(channel_id: int, title: str, description: str, webhook_obj: Optional[discord.Webhook] = None):
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        logger.warning("channel %s not found", channel_id)
+        return
+    header = f"**{title}**\n\n"
+    chunks = split_long_message(header + description)
+    try:
+        if webhook_obj:
+            for chunk in chunks:
+                try:
+                    await webhook_obj.send(chunk, username=webhook_obj.name, wait=True)
+                except Exception:
+                    logger.exception("webhook send failed; falling back to channel.send")
+                    await channel.send(chunk)
+        else:
+            for chunk in chunks:
+                await channel.send(chunk)
+        await asyncio.sleep(0.05)
+    except Exception:
+        logger.exception("send_narration failed; fallback")
+        try:
+            for chunk in chunks:
+                await channel.send(chunk)
+        except Exception:
+            logger.exception("fallback send also failed")
+
+async def sender_loop():
+    global SENT_TIMESTAMPS
+    logger.info("sender loop started")
+    while True:
+        item = await MESSAGE_QUEUE.get()
+        if item is None:
+            logger.info("sender loop sentinel; exiting")
+            break
+        channel_id, title, description, webhook_obj = item
+        now = asyncio.get_event_loop().time()
+        window_start = now - 60.0
+        SENT_TIMESTAMPS = [t for t in SENT_TIMESTAMPS if t >= window_start]
+        if len(SENT_TIMESTAMPS) >= MAX_MESSAGES_PER_MINUTE:
+            wait = (SENT_TIMESTAMPS[0] + 60.0) - now + 0.1
+            logger.info("rate limit reached; waiting %.2fs", wait)
+            await asyncio.sleep(wait)
+        await send_narration(channel_id, title, description, webhook_obj)
+        SENT_TIMESTAMPS.append(asyncio.get_event_loop().time())
+
+async def queue_message(channel_id: int, title: str, description: str, webhook_obj: Optional[discord.Webhook] = None):
+    await MESSAGE_QUEUE.put((channel_id, title, description, webhook_obj))
+
+async def create_category_and_channel_if_needed(guild: discord.Guild, category_name: str, channel_name: str) -> Optional[discord.TextChannel]:
+    try:
+        category = discord.utils.get(guild.categories, name=category_name)
+        if not category:
+            if guild.me.guild_permissions.manage_channels:
+                category = await guild.create_category(category_name)
+                logger.info("created category %s", category_name)
+            else:
+                logger.warning("no manage_channels permission")
+                return None
+        channel = discord.utils.get(category.channels, name=channel_name)
+        if not channel:
+            if guild.me.guild_permissions.manage_channels:
+                channel = await category.create_text_channel(channel_name)
+                logger.info("created channel %s under %s", channel_name, category_name)
+            else:
+                logger.warning("no permission to create channel")
+                return None
+        return channel
+    except Exception:
+        logger.exception("failed create_category_and_channel_if_needed")
+        return None
+
+class BackgroundRunner:
+    def __init__(self, engine: EventEngine):
+        self.engine = engine
+
+    async def run_loop(self):
+        logger.info("background loop started")
+        while True:
+            try:
+                await asyncio.sleep(EVENT_INTERVAL_SECONDS)
+                title, desc, importance = await self.engine.tick()
+                publish = True if importance >= 2 else (random.random() < 0.6)
+                if publish and PRIMARY_CHANNEL:
+                    await queue_message(PRIMARY_CHANNEL, title, desc, None)
+                    if ANNOUNCE_CHANNEL:
+                        await queue_message(ANNOUNCE_CHANNEL, title, desc, None)
+                if random.random() < WEBHOOK_INTERACTION_CHANCE:
+                    await self.maybe_make_webhooks_interact()
+            except asyncio.CancelledError:
+                logger.info("background loop cancelled")
+                break
+            except Exception:
+                logger.exception("error in background loop")
+
+    async def maybe_make_webhooks_interact(self):
+        try:
+            mapping = await get_webhook_map()
+            if not mapping:
+                return
+            candidates = []
+            for ent_id, info in mapping.items():
+                ch_id = info.get("channel_id")
+                row = await DB.get_entity(ent_id)
+                location = row[5] if row and len(row) > 5 else ""
+                candidates.append((ent_id, info, ch_id, location))
+            pairs = []
+            for i in range(len(candidates)):
+                for j in range(i+1, len(candidates)):
+                    a = candidates[i]
+                    b = candidates[j]
+                    same_channel = a[2] and b[2] and int(a[2]) == int(b[2])
+                    same_location = a[3] and b[3] and a[3] == b[3]
+                    if same_channel or same_location:
+                        pairs.append((a, b))
+            if not pairs:
+                return
+            a, b = random.choice(pairs)
+            try:
+                ch_a = bot.get_channel(int(a[1]["channel_id"]))
+                ch_b = bot.get_channel(int(b[1]["channel_id"]))
+                wh_a = await ch_a.fetch_webhook(int(a[1]["webhook_id"]))
+                wh_b = await ch_b.fetch_webhook(int(b[1]["webhook_id"]))
+            except Exception:
+                return
+            prompt_a = f"{a[1]['name']} diz algo curto e apropriado para {b[1]['name']} (contexto: proximidade)."
+            prompt_b = f"{b[1]['name']} responde rapidamente a {a[1]['name']}."
+            line_a = await TEXT_GENERATOR.generate(prompt=prompt_a)
+            line_b = await TEXT_GENERATOR.generate(prompt=prompt_b)
+            try:
+                await wh_a.send(line_a, username=wh_a.name, wait=True)
+                await asyncio.sleep(0.5)
+                await wh_b.send(line_b, username=wh_b.name, wait=True)
+                summary = f"{a[1]['name']} e {b[1]['name']} interagiram: «{line_a}» → «{line_b}»"
+                await DB.add_event("Interação de NPCs", summary, 2)
+                if ANNOUNCE_CHANNEL:
+                    await queue_message(ANNOUNCE_CHANNEL, "Interação entre NPCs", summary, None)
+            except Exception:
+                summary = f"{a[1]['name']} e {b[1]['name']} tentaram interagir: «{line_a}» → «{line_b}»"
+                await DB.add_event("Interação NPC (fallback)", summary, 1)
+                if PRIMARY_CHANNEL:
+                    await queue_message(PRIMARY_CHANNEL, "Interação (fallback)", summary, None)
+        except Exception:
+            logger.exception("maybe_make_webhooks_interact failed")
+
+@bot.event
+async def on_message(message: discord.Message):
+    try:
+        if message.author and message.author.id == bot.user.id:
+            return
+
+        wh_map = await get_webhook_map()
+        our_wh_ids = set()
+        for v in wh_map.values():
+            if v.get("webhook_id"):
+                try:
+                    our_wh_ids.add(int(v["webhook_id"]))
+                except Exception:
+                    pass
+
+        if message.webhook_id and int(message.webhook_id) in our_wh_ids:
+            ent = None
+            for eid, info in wh_map.items():
+                if int(info.get("webhook_id", -1)) == int(message.webhook_id):
+                    ent = {"id": eid, "name": info.get("name")}
+                    break
+            content = (message.content or "").strip()
+            summary = f"{ent['name']} (webhook) falou: {content}"
+            await DB.add_event("NPC falou", summary, 1)
+            target = ANNOUNCE_CHANNEL or PRIMARY_CHANNEL or message.channel.id
+            await queue_message(target, f"{ent['name']} disse algo", summary, None)
+            return
+
+        memory_on = await is_memory_enabled(message.channel.id)
+
+        if memory_on and message.author and not message.author.bot:
+            await DB.add_message(
+                str(message.id),
+                str(message.channel.id),
+                str(message.author.id),
+                message.author.display_name,
+                message.content or ""
+            )
+
+        if message.webhook_id and (int(message.webhook_id) not in our_wh_ids):
+            history = None
+            if memory_on:
+                hist_rows = await DB.get_channel_history(str(message.channel.id), limit=10)
+                history = [f"[{name}] {content}" for name, content, _ in hist_rows]
+            reply = await TEXT_GENERATOR.generate(prompt=message.content or "Um som estranho ecoa.", history=history)
+            parts = split_long_message(reply)
+            try:
+                await message.reply(parts[0], mention_author=False)
+                for extra in parts[1:]:
+                    await message.channel.send(extra)
+            except Exception:
+                try:
+                    await message.channel.send(parts[0])
+                    for extra in parts[1:]:
+                        await message.channel.send(extra)
+                except Exception:
+                    logger.exception("failed to respond to external webhook")
+            return
+
+        if isinstance(message.channel, discord.DMChannel):
+            return
+
+        prompt_text = (message.content or "").strip()[:1000] or "O usuário disse algo."
+        history = None
+        if memory_on:
+            hist_rows = await DB.get_channel_history(str(message.channel.id), limit=10)
+            history = [f"[{name}] {content}" for name, content, _ in hist_rows]
+        reply = await TEXT_GENERATOR.generate(prompt=prompt_text, history=history)
+        parts = split_long_message(reply)
+        try:
+            await message.reply(parts[0], mention_author=False)
+            for extra in parts[1:]:
+                await message.channel.send(extra)
+        except Exception:
+            try:
+                await message.channel.send(parts[0])
+                for extra in parts[1:]:
+                    await message.channel.send(extra)
+            except Exception:
+                logger.exception("failed responding to message")
+    except Exception:
+        logger.exception("on_message handler failed")
+
+def is_admin():
+    async def predicate(interaction: discord.Interaction):
+        if interaction.user.guild_permissions.administrator:
+            return True
+        app_owner = await bot.application_info()
+        if interaction.user.id == app_owner.owner.id:
+            return True
+        return False
+    return app_commands.check(predicate)
+
+@bot.event
+async def on_ready():
+    global TEXT_GENERATOR, ENGINE, FILES_MAP, SENDER_TASK, BACKGROUND_TASK
+    logger.info("Bot ready — version %s (build %s)", VERSION, BUILD_DATE)
+    await DB.init()
+    corpus, files_map = load_system_corpus(SYSTEM_FOLDER)
+    FILES_MAP = files_map
+    TEXT_GENERATOR = TextGenerator(corpus, keys_manager)
+    ENGINE = EventEngine(DB, TEXT_GENERATOR)
+    if PRIMARY_CHANNEL:
+        await DB.ensure_location(str(PRIMARY_CHANNEL), f"channel_{PRIMARY_CHANNEL}", "channel", f"Canal primário ID {PRIMARY_CHANNEL}")
+    ents = extract_entities_from_corpus(corpus, max_entities=100)
+    for e in ents:
+        ent_id = f"id_{random.randint(100000,999999)}"
+        default_loc = str(PRIMARY_CHANNEL) if PRIMARY_CHANNEL else ""
+        await DB.add_entity(ent_id, e["name"], e.get("kind","lore"), e["description"], 1, default_loc)
+        if PRIMARY_CHANNEL and e.get("kind") in ("npc", "creature", "lore"):
+            ch = bot.get_channel(PRIMARY_CHANNEL)
+            if ch and ch.permissions_for(ch.guild.me).manage_webhooks:
+                await ensure_webhook_for_entity(ch, e["name"], ent_id)
+    if not SENDER_TASK:
+        SENDER_TASK = asyncio.create_task(sender_loop())
+    if not BACKGROUND_TASK:
+        BACKGROUND_TASK = asyncio.create_task(BackgroundRunner(ENGINE).run_loop())
+    try:
+        await tree.sync()
+    except Exception:
+        logger.exception("failed to sync slash commands")
+
+@tree.command(name="version", description="Mostra a versão do bot")
+async def version_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message(f"WorldBox Master AI — versão {VERSION} (build {BUILD_DATE})")
+
+@tree.command(name="set_primary_channel", description="Define canal primário de narração")
+@is_admin()
+@app_commands.describe(channel="Canal onde o bot publicará narrativas")
+async def set_primary_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    global PRIMARY_CHANNEL
+    PRIMARY_CHANNEL = channel.id
+    await DB.ensure_location(str(channel.id), f"channel_{channel.id}", "channel", f"Canal primário ID {channel.id}")
+    await interaction.response.send_message(f"Canal primário definido para {channel.mention}")
+
+@tree.command(name="set_announcement_channel", description="Define canal global de anúncios do mundo")
+@is_admin()
+@app_commands.describe(channel="Canal de anúncios")
+async def set_announcement_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    global ANNOUNCE_CHANNEL
+    ANNOUNCE_CHANNEL = channel.id
+    await DB.ensure_location(str(channel.id), f"channel_{channel.id}", "channel", f"Canal de anúncios ID {channel.id}")
+    await interaction.response.send_message(f"Canal de anúncios definido para {channel.mention}")
+
+@tree.command(name="add_google_keys", description="Adiciona/atualiza Google API keys via JSON string")
+@is_admin()
+@app_commands.describe(keys_json='JSON string: {"keys":["K1","K2",...]}')
+async def add_google_keys(interaction: discord.Interaction, keys_json: str):
+    try:
+        data = json.loads(keys_json)
+        if isinstance(data, dict) and "keys" in data:
+            keys = data["keys"]
+        elif isinstance(data, list):
+            keys = data
+        else:
+            await interaction.response.send_message("JSON inválido. Use {\"keys\": [..]} ou lista simples.", ephemeral=True)
+            return
+        if not isinstance(keys, list):
+            await interaction.response.send_message("A propriedade 'keys' deve ser uma lista.", ephemeral=True)
+            return
+    except Exception as e:
+        await interaction.response.send_message(f"JSON inválido: {e}", ephemeral=True)
+        return
+    added = keys_manager.add_keys(keys)
+    await interaction.response.send_message(f"{added} chaves salvas (limite {MAX_GOOGLE_KEYS}).")
+
+@bot.command(name="addkeys_file")
+@commands.has_permissions(administrator=True)
+async def addkeys_file(ctx):
+    if not ctx.message.attachments:
+        await ctx.send("Anexe um arquivo JSON contendo {\"keys\": [\"K1\",\"K2\", ...]} ao comando.")
+        return
+    att = ctx.message.attachments[0]
+    try:
+        data = await att.read()
+        obj = json.loads(data.decode("utf-8"))
+        if isinstance(obj, dict) and "keys" in obj:
+            keys = obj["keys"]
+        elif isinstance(obj, list):
+            keys = obj
+        else:
+            await ctx.send("Formato inválido no JSON.")
+            return
+        if not isinstance(keys, list):
+            await ctx.send("A propriedade 'keys' precisa ser uma lista.")
+            return
+    except Exception as e:
+        await ctx.send(f"Falha lendo arquivo JSON: {e}")
+        return
+    added = keys_manager.add_keys(keys)
+    await ctx.send(f"{added} chaves salvas (limite {MAX_GOOGLE_KEYS}).")
+
+@tree.command(name="forcerun", description="Força um tick e retorna o evento gerado")
+@is_admin()
+async def forcerun(interaction: discord.Interaction):
+    title, desc, importance = await ENGINE.tick()
+    parts = split_long_message(f"**{title}**\n\n{desc}")
+    await interaction.response.send_message(parts[0])
+    if PRIMARY_CHANNEL:
+        for extra in parts[1:]:
+            await queue_message(PRIMARY_CHANNEL, title, extra, None)
+
+@tree.command(name="reloadsystem", description="Recarrega system_files e rebuilda corpus")
+@is_admin()
+async def reloadsystem(interaction: discord.Interaction):
+    corpus, files_map = load_system_corpus(SYSTEM_FOLDER)
+    global TEXT_GENERATOR, ENGINE, FILES_MAP
+    FILES_MAP = files_map
+    TEXT_GENERATOR = TextGenerator(corpus, keys_manager)
+    ENGINE = EventEngine(DB, TEXT_GENERATOR)
+    await interaction.response.send_message("Sistema recarregado a partir de system_files/")
+
+@tree.command(name="list_entities", description="Lista entidades")
+@is_admin()
+@app_commands.describe(limit="quantidade máxima de entidades para listar")
+async def list_entities(interaction: discord.Interaction, limit: int = 25):
+    rows = await DB.list_entities(limit=limit)
+    if not rows:
+        await interaction.response.send_message("Nenhuma entidade encontrada.")
+        return
+    text = "\n".join([f"{r[0]} | {r[1]} ({r[2]}) loc={r[5] or '—'}" for r in rows])
+    parts = split_long_message(text)
+    await interaction.response.send_message(parts[0])
+    for p in parts[1:]:
+        await interaction.followup.send(p)
+
+@tree.command(name="create_entity", description="Cria entidade e opcionalmente webhook")
+@is_admin()
+@app_commands.describe(name="nome", kind="tipo", description="descrição", location="localização")
+async def create_entity(interaction: discord.Interaction, name: str, kind: str, description: str, location: Optional[str] = ""):
+    ent_id = f"id_{random.randint(100000,999999)}"
+    loc_val = location or (str(PRIMARY_CHANNEL) if PRIMARY_CHANNEL else "")
+    await DB.add_entity(ent_id, name, kind, description, 1, loc_val)
+    webhook_obj = None
+    if PRIMARY_CHANNEL and kind.lower() in ("npc", "creature", "npc-player", "character", "agent"):
+        ch = bot.get_channel(PRIMARY_CHANNEL)
+        if ch and ch.permissions_for(ch.guild.me).manage_webhooks:
+            wh = await ensure_webhook_for_entity(ch, name, ent_id)
+            webhook_obj = wh
+    await interaction.response.send_message(f"Entidade {name} ({kind}) criada com id {ent_id}, location='{loc_val}'.")
+
+@tree.command(name="move_entity", description="Move uma entidade para outra location")
+@is_admin()
+@app_commands.describe(entity_id="ID da entidade", new_location="nova localização")
+async def move_entity(interaction: discord.Interaction, entity_id: str, new_location: str):
+    loc = new_location.strip()
+    m = re.match(r"<#(\d+)>", loc)
+    if m:
+        loc = m.group(1)
+    await DB.move_entity(entity_id, loc)
+    await interaction.response.send_message(f"Entidade {entity_id} movida para '{loc}'.")
+
+@tree.command(name="list_locations", description="Lista todos os locais conhecidos")
+@is_admin()
+async def list_locations(interaction: discord.Interaction):
+    rows = await DB.list_locations()
+    if not rows:
+        await interaction.response.send_message("Nenhum local cadastrado.")
+        return
+    text = "\n".join([f"{r[0]} | {r[1]} ({r[2]}) — {r[3]}" for r in rows])
+    parts = split_long_message(text)
+    await interaction.response.send_message(parts[0])
+    for p in parts[1:]:
+        await interaction.followup.send(p)
+
+@tree.command(name="add_location", description="Adiciona um local manualmente")
+@is_admin()
+@app_commands.describe(loc_id="ID único", name="Nome", kind="Tipo", description="Descrição")
+async def add_location(interaction: discord.Interaction, loc_id: str, name: str, kind: str, description: str):
+    await DB.add_location(loc_id, name, kind, description)
+    await interaction.response.send_message(f"Local {name} (ID: {loc_id}) adicionado.")
+
+@tree.command(name="toggle_memory", description="Ativa/desativa a memória de mensagens para um canal")
+@is_admin()
+@app_commands.describe(channel="Canal (padrão: canal atual)")
+async def toggle_memory(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    ch = channel or interaction.channel
+    if not isinstance(ch, discord.TextChannel):
+        await interaction.response.send_message("Canal inválido.", ephemeral=True)
+        return
+    new_state = await toggle_memory(ch.id)
+    state_str = "ativada" if new_state else "desativada"
+    await interaction.response.send_message(f"Memória {state_str} para {ch.mention}.")
+
+@tree.command(name="clear_memory", description="Apaga todo o histórico de mensagens de um canal")
+@is_admin()
+@app_commands.describe(channel="Canal (padrão: canal atual)")
+async def clear_memory(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    ch = channel or interaction.channel
+    if not isinstance(ch, discord.TextChannel):
+        await interaction.response.send_message("Canal inválido.", ephemeral=True)
+        return
+    await DB.clear_channel_history(str(ch.id))
+    await interaction.response.send_message(f"Histórico de mensagens apagado para {ch.mention}.")
+
+@tree.command(name="set_history_size", description="Define quantas mensagens são lembradas por canal (global)")
+@is_admin()
+@app_commands.describe(tamanho="Número de mensagens (ex: 20)")
+async def set_history_size(interaction: discord.Interaction, tamanho: int):
+    global MAX_HISTORY_MESSAGES
+    if tamanho < 1:
+        await interaction.response.send_message("O tamanho deve ser pelo menos 1.", ephemeral=True)
+        return
+    MAX_HISTORY_MESSAGES = tamanho
+    await interaction.response.send_message(f"Tamanho do histórico global alterado para {tamanho} mensagens por canal.")
+
+async def shutdown():
+    logger.info("shutdown: send sentinel and cancel tasks")
+    await MESSAGE_QUEUE.put(None)
+    for t in asyncio.all_tasks():
+        if t is not asyncio.current_task():
+            t.cancel()
+    logger.info("shutdown complete")
+
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        print("ERRO: defina DISCORD_BOT_TOKEN no ambiente.")
+        raise SystemExit(1)
+    try:
+        bot.run(DISCORD_TOKEN)
+    except KeyboardInterrupt:
+        logger.info("interrupted, exiting")
+EOF
+
+# ============================================================
+# Criar arquivo do scraper (v1.3)
+# ============================================================
+echo -e "${YELLOW}[8/8] Gerando scraper: wiki_scraper_v1_3.py${NC}"
+cat > wiki_scraper_v1_3.py << 'EOF'
+# wiki_scraper_v1_3.py
+"""
+WorldBox Wiki Scraper — versão v1.3
+Build: 2026-03-10
+
+NOVO: Gera um ÚNICO arquivo PDF com todas as páginas da wiki!
+- Texto puro, sem imagens
+- Cada página da wiki vira uma seção no PDF
+- Sumário automático com hyperlinks
+- Download paralelo super rápido
+
+Uso:
+    python wiki_scraper_v1_3.py --start URL --max 1000 --workers 20
+"""
+
+import os
+import re
+import argparse
+import asyncio
+from urllib.parse import urljoin, urlparse
+from typing import Set, List, Tuple
+import logging
+
+import aiohttp
+from bs4 import BeautifulSoup
+from tqdm.asyncio import tqdm
+
+# PDF generation
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.lib.enums import TA_LEFT, TA_CENTER
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.fonts import addMapping
+
+# Configurações
+DEFAULT_START = "https://worldbox-game.fandom.com/wiki/WorldBox_Wiki"
+DEFAULT_MAX_PAGES = 500
+DEFAULT_WORKERS = 10
+SYSTEM_FOLDER = "system_files"  # mesma pasta do bot
+PDF_FILENAME = "worldbox_wiki_complete.pdf"
+TXT_FALLBACK_FILENAME = "worldbox_wiki_complete.txt"
+
+HEADERS = {
+    "User-Agent": "WorldBoxMasterAI/1.3 (PDF generator; educational purpose)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
+# Configura logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("wiki_scraper_pdf")
+
+class WikiScraperPDF:
+    def __init__(self, start_url: str, max_pages: int, max_workers: int):
+        self.start_url = start_url
+        self.max_pages = max_pages
+        self.max_workers = max_workers
+        self.base_netloc = urlparse(start_url).netloc
+        self.seen_urls: Set[str] = set()
+        self.to_visit: List[str] = [start_url]
+        self.pages_content: List[Tuple[str, str]] = []  # (título, conteúdo_texto)
+        self.session: aiohttp.ClientSession = None
+        self.semaphore: asyncio.Semaphore = None
+        self.pbar: tqdm = None
+
+    def is_same_domain(self, url: str) -> bool:
+        """Verifica se a URL pertence ao mesmo domínio da wiki."""
+        parsed = urlparse(url)
+        if not parsed.netloc:
+            return True
+        return parsed.netloc == self.base_netloc or parsed.netloc.endswith("." + self.base_netloc)
+
+    def extract_title(self, soup: BeautifulSoup, url: str) -> str:
+        """Extrai o título da página."""
+        # Tenta encontrar o título da wiki
+        title_tag = soup.find("h1", id="firstHeading") or soup.find("h1", class_="page-title") or soup.find("title")
+        if title_tag:
+            title = title_tag.get_text().strip()
+            # Remove sufixos comuns
+            title = re.sub(r"\s*\|\s*WorldBox Wiki.*$", "", title, flags=re.IGNORECASE)
+            title = re.sub(r"\s*-\s*WorldBox.*$", "", title, flags=re.IGNORECASE)
+            return title
+        
+        # Fallback: usar a última parte da URL
+        path = urlparse(url).path
+        if path and path != "/":
+            return path.split("/")[-1].replace("_", " ")
+        return "Página sem título"
+
+    def extract_text(self, html: str, url: str) -> Tuple[str, str]:
+        """
+        Extrai texto limpo do HTML.
+        Retorna (título, texto)
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        
+        # Remove elementos indesejados completamente
+        for tag in soup(["script", "style", "noscript", "nav", "footer", "header", 
+                         "aside", "form", "button", "input", "img", "svg"]):
+            tag.decompose()
+        
+        # Remove classes e IDs que indicam elementos não-conteúdo
+        for class_name in ["sidebar", "navigation", "menu", "toc", "infobox", "metadata"]:
+            for element in soup.find_all(class_=re.compile(class_name, re.I)):
+                element.decompose()
+        
+        # Título
+        title = self.extract_title(soup, url)
+        
+        # Área de conteúdo principal
+        content = (
+            soup.find(id="mw-content-text") or
+            soup.find("article") or
+            soup.find("main") or
+            soup.find("div", class_="content") or
+            soup.body
+        )
+        if not content:
+            content = soup
+        
+        # Extrai texto
+        text = content.get_text(separator="\n")
+        
+        # Limpeza pesada
+        lines = []
+        for line in text.splitlines():
+            line = line.strip()
+            # Remove linhas muito curtas ou que parecem código/menu
+            if len(line) < 3:
+                continue
+            if re.match(r'^[\W_]+$', line):  # linha só com pontuação
+                continue
+            if re.search(r'(navigation|menu|sidebar|click|edit|view history)', line, re.I):
+                continue
+            lines.append(line)
+        
+        # Remove duplicatas consecutivas
+        cleaned = []
+        for line in lines:
+            if not cleaned or line != cleaned[-1]:
+                cleaned.append(line)
+        
+        return title, "\n\n".join(cleaned)
+
+    def get_links(self, html: str, base_url: str) -> List[str]:
+        """Extrai todos os links internos da wiki."""
+        soup = BeautifulSoup(html, "html.parser")
+        links = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("#") or not href.strip():
+                continue
+            full_url = urljoin(base_url, href)
+            full_url = full_url.split("#")[0]
+            if self.is_same_domain(full_url) and full_url not in self.seen_urls:
+                links.append(full_url)
+        return links
+
+    async def fetch_page(self, url: str) -> tuple[str, str] | None:
+        """Baixa uma página e retorna (url, html) ou None em erro."""
+        try:
+            async with self.semaphore:
+                async with self.session.get(url, timeout=30) as response:
+                    if response.status == 200:
+                        html = await response.text()
+                        return url, html
+                    else:
+                        logger.warning(f"Falha {response.status}: {url}")
+                        return None
+        except Exception as e:
+            logger.warning(f"Erro ao baixar {url}: {e}")
+            return None
+
+    async def process_page(self, url: str):
+        """Baixa uma página, extrai texto e links."""
+        result = await self.fetch_page(url)
+        if not result:
+            return
+        
+        url, html = result
+        
+        # Extrai título e texto
+        title, text = self.extract_text(html, url)
+        if text and len(text) > 100:  # só salva se tiver conteúdo mínimo
+            self.pages_content.append((title, text))
+        
+        # Extrai novos links
+        new_links = self.get_links(html, url)
+        for link in new_links:
+            if link not in self.seen_urls and link not in self.to_visit:
+                self.to_visit.append(link)
+        
+        self.pbar.update(1)
+        self.pbar.set_description(f"Baixadas: {len(self.seen_urls)} | Conteúdo: {len(self.pages_content)} | Fila: {len(self.to_visit)}")
+
+    def generate_pdf(self, output_path: str):
+        """Gera um único PDF com todo o conteúdo."""
+        logger.info(f"Gerando PDF com {len(self.pages_content)} páginas...")
+        
+        doc = SimpleDocTemplate(
+            output_path,
+            pagesize=A4,
+            leftMargin=2*cm,
+            rightMargin=2*cm,
+            topMargin=2*cm,
+            bottomMargin=2*cm,
+            title="WorldBox Wiki - Coleção Completa",
+            author="WorldBox Master AI"
+        )
+        
+        # Estilos
+        styles = getSampleStyleSheet()
+        
+        # Estilo para títulos de página
+        title_style = ParagraphStyle(
+            'PageTitle',
+            parent=styles['Heading1'],
+            fontSize=18,
+            alignment=TA_LEFT,
+            spaceAfter=12,
+            textColor='#2c3e50'
+        )
+        
+        # Estilo para texto normal
+        text_style = ParagraphStyle(
+            'PageText',
+            parent=styles['Normal'],
+            fontSize=10,
+            alignment=TA_LEFT,
+            spaceAfter=6,
+            firstLineIndent=0.5*cm
+        )
+        
+        # Estilo para o título do sumário
+        toc_title_style = ParagraphStyle(
+            'TOCTitle',
+            parent=styles['Heading1'],
+            fontSize=24,
+            alignment=TA_CENTER,
+            spaceAfter=24,
+            textColor='#34495e'
+        )
+        
+        # Conteúdo do PDF
+        story = []
+        
+        # Página de título
+        story.append(Paragraph("WorldBox Wiki", toc_title_style))
+        story.append(Paragraph("Coleção Completa de Texto", styles['Heading2']))
+        story.append(Spacer(1, 2*cm))
+        story.append(Paragraph(f"Gerado em: {__import__('datetime').datetime.now().strftime('%d/%m/%Y %H:%M')}", styles['Normal']))
+        story.append(Paragraph(f"Total de páginas: {len(self.pages_content)}", styles['Normal']))
+        story.append(PageBreak())
+        
+        # Sumário
+        story.append(Paragraph("Sumário", toc_title_style))
+        for i, (title, _) in enumerate(self.pages_content, 1):
+            # Cria um link interno para a página
+            link_text = f'<link href="#page{i}">{i}. {title[:80]}{"..." if len(title) > 80 else ""}</link>'
+            story.append(Paragraph(link_text, styles['Normal']))
+            story.append(Spacer(1, 0.2*cm))
+        story.append(PageBreak())
+        
+        # Conteúdo das páginas
+        for i, (title, text) in enumerate(self.pages_content, 1):
+            # Âncora para o sumário
+            story.append(Paragraph(f'<a name="page{i}"/>', styles['Normal']))
+            
+            # Título da página
+            story.append(Paragraph(f"{i}. {title}", title_style))
+            
+            # Quebra o texto em parágrafos
+            paragraphs = text.split('\n\n')
+            for para in paragraphs:
+                if para.strip():
+                    # Escapa caracteres especiais do PDF
+                    para = para.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                    story.append(Paragraph(para, text_style))
+                    story.append(Spacer(1, 0.2*cm))
+            
+            # Nova página
+            story.append(PageBreak())
+        
+        # Gera o PDF
+        doc.build(story)
+        logger.info(f"PDF gerado com sucesso: {output_path}")
+
+    def generate_txt_fallback(self, output_path: str):
+        """Fallback: gera um único arquivo TXT se PDF falhar."""
+        logger.info(f"Gerando arquivo TXT de fallback...")
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("WORLDBOX WIKI - COLEÇÃO COMPLETA\n")
+            f.write("=" * 50 + "\n\n")
+            f.write(f"Total de páginas: {len(self.pages_content)}\n")
+            f.write(f"Gerado em: {__import__('datetime').datetime.now()}\n\n")
+            
+            for i, (title, text) in enumerate(self.pages_content, 1):
+                f.write(f"\n\n{'='*60}\n")
+                f.write(f"{i}. {title.upper()}\n")
+                f.write(f"{'='*60}\n\n")
+                f.write(text)
+                f.write("\n\n")
+        
+        logger.info(f"Arquivo TXT gerado: {output_path}")
+
+    async def run(self):
+        """Executa o scraping completo."""
+        # Cria pasta se não existir
+        os.makedirs(SYSTEM_FOLDER, exist_ok=True)
+        
+        # Configura sessão e semáforo
+        self.session = aiohttp.ClientSession(headers=HEADERS)
+        self.semaphore = asyncio.Semaphore(self.max_workers)
+        
+        # Barra de progresso
+        self.pbar = tqdm(total=min(self.max_pages, 1), desc="Iniciando", unit="páginas")
+        
+        try:
+            while self.to_visit and len(self.seen_urls) < self.max_pages:
+                # Pega próximo lote de URLs
+                batch = []
+                while self.to_visit and len(batch) < self.max_workers * 2:
+                    url = self.to_visit.pop(0)
+                    if url not in self.seen_urls:
+                        batch.append(url)
+                        self.seen_urls.add(url)
+                
+                if not batch:
+                    continue
+                
+                # Processa lote em paralelo
+                tasks = [self.process_page(url) for url in batch]
+                await asyncio.gather(*tasks)
+                
+                # Atualiza total da barra
+                self.pbar.total = min(self.max_pages, max(self.pbar.total, len(self.seen_urls) + len(self.to_visit)))
+            
+            self.pbar.close()
+            
+            # Ordena páginas por título (opcional)
+            self.pages_content.sort(key=lambda x: x[0])
+            
+            logger.info(f"Download concluído! {len(self.pages_content)} páginas com conteúdo relevante.")
+            
+            # Gera PDF
+            pdf_path = os.path.join(SYSTEM_FOLDER, PDF_FILENAME)
+            try:
+                self.generate_pdf(pdf_path)
+                logger.info(f"PDF salvo em: {pdf_path}")
+            except Exception as e:
+                logger.error(f"Falha ao gerar PDF: {e}")
+                logger.info("Gerando arquivo TXT como fallback...")
+                txt_path = os.path.join(SYSTEM_FOLDER, TXT_FALLBACK_FILENAME)
+                self.generate_txt_fallback(txt_path)
+            
+        finally:
+            await self.session.close()
+
+def main():
+    parser = argparse.ArgumentParser(description="Download da wiki em um único PDF")
+    parser.add_argument("--start", "-s", default=DEFAULT_START, help="URL inicial da wiki")
+    parser.add_argument("--max", "-m", type=int, default=DEFAULT_MAX_PAGES, help="Número máximo de páginas")
+    parser.add_argument("--workers", "-w", type=int, default=DEFAULT_WORKERS, help="Downloads simultâneos")
+    
+    args = parser.parse_args()
+    
+    logger.info("=" * 60)
+    logger.info("Wiki Scraper v1.3 - PDF Generator")
+    logger.info("=" * 60)
+    logger.info(f"URL inicial: {args.start}")
+    logger.info(f"Páginas máximas: {args.max}")
+    logger.info(f"Trabalhadores simultâneos: {args.workers}")
+    logger.info(f"Pasta de destino: {SYSTEM_FOLDER}/")
+    logger.info(f"Arquivo final: {PDF_FILENAME} (ou {TXT_FALLBACK_FILENAME} em caso de erro)")
+    logger.info("=" * 60)
+    
+    scraper = WikiScraperPDF(args.start, args.max, args.workers)
+    asyncio.run(scraper.run())
+
+if __name__ == "__main__":
+    main()
+EOF
+
+# Volta para o diretório original (opcional)
+cd ..
+
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}  Instalação concluída com sucesso!    ${NC}"
+echo -e "${GREEN}========================================${NC}"
+echo ""
+echo -e "${YELLOW}Próximos passos:${NC}"
+echo "1. Edite o arquivo .env e coloque seu token do bot do Discord:"
+echo "   nano $PROJECT_DIR/.env"
+echo ""
+echo "2. Entre na pasta do projeto:"
+echo "   cd $PROJECT_DIR"
+echo ""
+echo "3. Ative o ambiente virtual:"
+echo "   source venv/bin/activate"
+echo ""
+echo "4. Execute o scraper para baixar a wiki (recomendado):"
+echo "   python wiki_scraper_v1_3.py --max 1000 --workers 20"
+echo ""
+echo "5. Inicie o bot:"
+echo "   python worldbox_master_ai_v1_6.py"
+echo ""
+echo -e "${GREEN}Divirta-se com seu mundo vivo!${NC}"
